@@ -1,11 +1,11 @@
 from textwrap import dedent
 
-from django.template import Context
+from django.template import Context, Template
 
 from .django_test_setup import *  # NOQA
-from .testutils import Django30CompatibleSimpleTestCase as SimpleTestCase
 
 from django_components import component
+from .testutils import Django30CompatibleSimpleTestCase as SimpleTestCase
 
 
 class ComponentTest(SimpleTestCase):
@@ -98,6 +98,8 @@ class ComponentTest(SimpleTestCase):
             """)
         )
 
+
+class ComponentMediaTests(SimpleTestCase):
     def test_component_media_with_strings(self):
         class SimpleComponent(component.Component):
             class Media:
@@ -163,4 +165,95 @@ class ComponentTest(SimpleTestCase):
                 <link href="path/to/style.css" type="text/css" media="all" rel="stylesheet">
                 <script src="path/to/script.js"></script>
             """)
+        )
+
+
+class ComponentIsolationTests(SimpleTestCase):
+    def setUp(self):
+        class SlottedComponent(component.Component):
+            def template(self, context):
+                return "slotted_template.html"
+
+        component.registry.register('test', SlottedComponent)
+
+    def test_instances_of_component_do_not_share_slots(self):
+        template = Template(
+            """
+            {% load component_tags %}
+            {% component_block "test" %}
+                {% slot "header" %}Override header{% endslot %}
+            {% endcomponent_block %}
+            {% component_block "test" %}
+                {% slot "main" %}Override main{% endslot %}
+            {% endcomponent_block %}
+            {% component_block "test" %}
+                {% slot "footer" %}Override footer{% endslot %}
+            {% endcomponent_block %}
+        """
+        )
+
+        template.render(Context({}))
+        rendered = template.render(Context({}))
+
+        self.assertHTMLEqual(
+            rendered,
+            """
+            <custom-template>
+                <header>Override header</header>
+                <main>Default main</main>
+                <footer>Default footer</footer>
+            </custom-template>
+            <custom-template>
+                <header>Default header</header>
+                <main>Override main</main>
+                <footer>Default footer</footer>
+            </custom-template>
+            <custom-template>
+                <header>Default header</header>
+                <main>Default main</main>
+                <footer>Override footer</footer>
+            </custom-template>
+        """
+        )
+
+
+class RecursiveSlotNameTest(SimpleTestCase):
+    def setUp(self):
+        @component.register('outer')
+        class OuterComponent(component.Component):
+            def template(self, context):
+                return "slotted_template.html"
+
+        @component.register('inner')
+        class InnerComponent(component.Component):
+            def template(self, context):
+                return "slotted_template.html"
+
+    def test_no_infinite_recursion_when_slot_name_is_reused(self):
+        template = Template(
+            """
+            {% load component_tags %}
+            {% component_block "outer" %}
+                {% slot "header" %}
+                    {% component_block "inner" %}{% endcomponent_block %}
+                {% endslot %}
+            {% endcomponent_block %}
+        """
+        )
+
+        self.assertHTMLEqual(
+            template.render(Context({})),
+            """
+            <custom-template>
+                <header>
+                    <custom-template>
+                        <header>Default header</header>
+                        <main>Default main</main>
+                        <footer>Default footer</footer>
+                    </custom-template>
+                </header>
+                <main>Default main</main>
+                <footer>Default footer</footer>
+            </custom-template>
+            """
         )

@@ -1,11 +1,9 @@
 import warnings
-from copy import copy
 from functools import lru_cache
-from itertools import chain
 
 from django.conf import settings
 from django.forms.widgets import MediaDefiningClass
-from django.template.base import NodeList, TokenType
+from django.template.base import Node, TokenType
 from django.template.loader import get_template
 from django.utils.safestring import mark_safe
 
@@ -13,6 +11,8 @@ from django.utils.safestring import mark_safe
 from django_components.component_registry import AlreadyRegistered, ComponentRegistry, NotRegistered  # noqa
 
 TEMPLATE_CACHE_SIZE = getattr(settings, "COMPONENTS", {}).get('TEMPLATE_CACHE_SIZE', 128)
+ACTIVE_SLOT_CONTEXT_KEY = '_DJANGO_COMPONENTS_ACTIVE_SLOTS'
+
 
 class SimplifiedInterfaceMediaDefiningClass(MediaDefiningClass):
     def __new__(mcs, name, bases, attrs):
@@ -38,6 +38,7 @@ class SimplifiedInterfaceMediaDefiningClass(MediaDefiningClass):
                 media.js = [media.js]
 
         return super().__new__(mcs, name, bases, attrs)
+
 
 class Component(metaclass=SimplifiedInterfaceMediaDefiningClass):
 
@@ -73,46 +74,48 @@ class Component(metaclass=SimplifiedInterfaceMediaDefiningClass):
 
     @staticmethod
     def is_slot_node(node):
-        return node.token.token_type == TokenType.BLOCK and node.token.split_contents()[0] == "slot"
+        return (isinstance(node, Node)
+                and node.token.token_type == TokenType.BLOCK
+                and node.token.split_contents()[0] == "slot")
 
     @lru_cache(maxsize=TEMPLATE_CACHE_SIZE)
-    def compile_instance_template(self, template_name):
-        """Use component's base template and the slots used for this instance to compile
-        a unified template for this instance."""
+    def get_processed_template(self, template_name):
+        """Retrieve the requested template and check for unused slots."""
 
-        component_template = get_template(template_name)
-        slots_in_template = Component.slots_in_template(component_template)
+        component_template = get_template(template_name).template
 
-        defined_slot_names = set(slots_in_template.keys())
-        filled_slot_names = set(self.slots.keys())
-        unexpected_slots = filled_slot_names - defined_slot_names
-        if unexpected_slots:
-            if settings.DEBUG:
+        # Traverse template nodes and descendants
+        visited_nodes = set()
+        nodes_to_visit = list(component_template.nodelist)
+        slots_seen = set()
+        while nodes_to_visit:
+            current_node = nodes_to_visit.pop()
+            if current_node in visited_nodes:
+                continue
+            visited_nodes.add(current_node)
+            for nodelist_name in current_node.child_nodelists:
+                nodes_to_visit.extend(getattr(current_node, nodelist_name, []))
+            if self.is_slot_node(current_node):
+                slots_seen.add(current_node.name)
+
+        # Check and warn for unknown slots
+        if settings.DEBUG:
+            filled_slot_names = set(self.slots.keys())
+            unused_slots = filled_slot_names - slots_seen
+            if unused_slots:
                 warnings.warn(
-                    "Component {} was provided with unexpected slots: {}".format(
-                        self._component_name, unexpected_slots
+                    "Component {} was provided with slots that were not used in a template: {}".format(
+                        self._component_name, unused_slots
                     )
                 )
-            for unexpected_slot in unexpected_slots:
-                del self.slots[unexpected_slot]
 
-        combined_slots = dict(slots_in_template, **self.slots)
-        if combined_slots:
-            # Replace slot nodes with their nodelists, then combine into a single, flat nodelist
-            node_iterator = ([node] if not Component.is_slot_node(node) else combined_slots[node.name]
-                             for node in component_template.template.nodelist)
-
-            instance_template = copy(component_template.template)
-            instance_template.nodelist = NodeList(chain.from_iterable(node_iterator))
-        else:
-            instance_template = component_template.template
-
-        return instance_template
+        return component_template
 
     def render(self, context):
         template_name = self.template(context)
-        instance_template = self.compile_instance_template(template_name)
-        return instance_template.render(context)
+        instance_template = self.get_processed_template(template_name)
+        with context.update({ACTIVE_SLOT_CONTEXT_KEY: self.slots}):
+            return instance_template.render(context)
 
     class Media:
         css = {}
@@ -121,6 +124,7 @@ class Component(metaclass=SimplifiedInterfaceMediaDefiningClass):
 
 # This variable represents the global component registry
 registry = ComponentRegistry()
+
 
 def register(name):
     """Class decorator to register a component.
@@ -133,6 +137,7 @@ def register(name):
         ...
 
     """
+
     def decorator(component):
         registry.register(name=name, component=component)
         return component
